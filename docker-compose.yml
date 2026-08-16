@@ -1,0 +1,40 @@
+services:
+  api:
+    build:
+      context: .
+    environment:
+      HTTP_ADDR: :8080
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/rinha?sslmode=disable
+      NATS_URL: nats://nats:4222
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    ports:
+      - "9999:8080"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: rinha
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rinha"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  nats:
+    image: nats:2-alpine
+    ports:
+      - "4222:4222"
+
+volumes:
+  postgres-data:
