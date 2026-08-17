@@ -1,18 +1,25 @@
 package main
 
 import (
-	"log"
 	"net/http"
+
+	"go.uber.org/zap"
 )
 
 func main() {
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+	defer logger.Sync()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	log.Println("payment-processor listening on :8080")
+	logger.Info("payment-processor listening", zap.String("address", ":8080"))
 	if err := http.ListenAndServe(":8080", mux); err != nil {
-		log.Fatal(err)
+		logger.Fatal("payment-processor stopped", zap.Error(err))
 	}
 }
