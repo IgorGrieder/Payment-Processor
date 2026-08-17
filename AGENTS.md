@@ -27,7 +27,7 @@ Do not change these decisions without an explicit user instruction.
 - Invalid JSON, an invalid/missing `correlationId`, or an invalid/non-positive amount returns `400 Bad Request` and creates no data.
 - In one PostgreSQL transaction, insert the payment and its outbox row. `correlation_id` is the unique payment primary key; duplicate incoming requests create no additional work but also return `202`.
 - PostgreSQL assigns `requested_at` at acceptance with `now()`. Persist and forward that exact timestamp on every processor retry.
-- Store money as `BIGINT` cents. Never use `float64` for money; format cents as decimals only at JSON boundaries.
+- Store money as `BIGINT` cents. At the JSON intake boundary, decode the amount as `float64` and convert it with `int64(math.Round(amount * 100))`; after that conversion, never use `float64` for money. Format cents as decimals only at JSON boundaries.
 - The payment row is the audit source of truth. Record terminal completion atomically with `processed_by_service`, `completed_by_instance`, and completion time.
 - The payment summary queries completed payment rows directly; do not maintain aggregate counters. Filter by the original `requested_at`, using the processor's effective behavior: when either `from` or `to` is absent, return all records; when both are present, use inclusive bounds.
 - Use a partial covering index for completed-payment summary queries, keyed by `requested_at` and covering processor and amount fields. Verify query plans with `EXPLAIN (ANALYZE, BUFFERS)` later.

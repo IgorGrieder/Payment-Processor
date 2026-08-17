@@ -33,8 +33,12 @@ services:
 
   nats:
     image: nats:2-alpine
+    command: ["-js", "-sd", "/data"]
     ports:
       - "4222:4222"
+    volumes:
+      - nats-data:/data
 
 volumes:
   postgres-data:
+  nats-data:
