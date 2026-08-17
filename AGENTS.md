@@ -10,6 +10,13 @@ This repository is being built collaboratively for the Rinha de Backend 2025 pay
 - Keep changes narrowly limited to the work explicitly requested.
 - Treat the challenge instructions as the source of truth. Call out hard requirements and distinguish them from optional strategies.
 
+## Implementation design
+
+- Organize application code as a layered architecture, with each layer depending only on the layer beneath it.
+- Prefer the fewest abstractions that clearly serve the current slice. Avoid speculative abstractions and overengineering.
+- Define an interface only at a real seam where behavior varies; keep every interface minimal, focused, and caller-oriented.
+- Prefer functional composition: explicit dependencies, data, and functions over object-oriented hierarchies or stateful objects.
+
 ## Agreed architecture
 
 Do not change these decisions without an explicit user instruction.
