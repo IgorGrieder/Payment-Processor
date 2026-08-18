@@ -2,16 +2,73 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+
+	"payment-processor/internal/domain"
 )
 
 func Connect(url string) (*nats.Conn, error) {
 	return nats.Connect(url)
+}
+
+// ProcessorAvailabilityPublisher sends transient versioned availability
+// updates. PostgreSQL is authoritative when a subscriber misses an event.
+type ProcessorAvailabilityPublisher func(context.Context, domain.ProcessorAvailability) error
+
+func NewProcessorAvailabilityPublisher(conn *nats.Conn, subject string) ProcessorAvailabilityPublisher {
+	return func(_ context.Context, state domain.ProcessorAvailability) error {
+		data, err := json.Marshal(processorAvailabilityEvent{
+			Service:          state.Service,
+			Available:        state.Available,
+			Version:          state.Version,
+			PassiveFailureAt: state.PassiveFailureAt,
+		})
+		if err != nil {
+			return fmt.Errorf("encode Processor Availability update: %w", err)
+		}
+		if err := conn.Publish(subject, data); err != nil {
+			return fmt.Errorf("publish Processor Availability update: %w", err)
+		}
+		return nil
+	}
+}
+
+// SubscribeProcessorAvailability subscribes before startup hydration. Version
+// ordering in the receiver resolves the live-delivery/hydration race.
+func SubscribeProcessorAvailability(conn *nats.Conn, subject string, handler func(domain.ProcessorAvailability)) (func(), error) {
+	subscription, err := conn.Subscribe(subject, func(message *nats.Msg) {
+		var event processorAvailabilityEvent
+		if err := json.Unmarshal(message.Data, &event); err != nil || !event.Service.Valid() || event.Version <= 0 {
+			return
+		}
+		handler(domain.ProcessorAvailability{
+			Service:          event.Service,
+			Available:        event.Available,
+			Version:          event.Version,
+			PassiveFailureAt: event.PassiveFailureAt,
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to Processor Availability updates: %w", err)
+	}
+	if err := conn.Flush(); err != nil {
+		subscription.Unsubscribe()
+		return nil, fmt.Errorf("activate Processor Availability subscription: %w", err)
+	}
+	return func() { _ = subscription.Unsubscribe() }, nil
+}
+
+type processorAvailabilityEvent struct {
+	Service          domain.ProcessorService `json:"service"`
+	Available        bool                    `json:"available"`
+	Version          int64                   `json:"version"`
+	PassiveFailureAt *time.Time              `json:"passiveFailureAt,omitempty"`
 }
 
 // WorkPublisher publishes durable Payment work references.

@@ -9,23 +9,27 @@ import (
 
 // Config contains runtime infrastructure configuration.
 type Config struct {
-	HTTPAddr                 string
-	DatabaseURL              string
-	DatabaseMaxConns         int
-	NATSURL                  string
-	InstanceID               string
-	OutboxWorkers            int
-	NATSPublishTimeout       time.Duration
-	OutboxClaimExpiry        time.Duration
-	JetStreamStream          string
-	JetStreamSubject         string
-	JetStreamDuplicateWindow time.Duration
-	ProcessingWorkers        int
-	PaymentClaimExpiry       time.Duration
-	ProcessorTimeout         time.Duration
-	ProcessorDefaultURL      string
-	JetStreamAckWait         time.Duration
-	JetStreamMaxAckPending   int
+	HTTPAddr                     string
+	DatabaseURL                  string
+	DatabaseMaxConns             int
+	NATSURL                      string
+	InstanceID                   string
+	OutboxWorkers                int
+	NATSPublishTimeout           time.Duration
+	OutboxClaimExpiry            time.Duration
+	JetStreamStream              string
+	JetStreamSubject             string
+	JetStreamDuplicateWindow     time.Duration
+	ProcessingWorkers            int
+	PaymentClaimExpiry           time.Duration
+	ProcessorTimeout             time.Duration
+	ProcessorDefaultURL          string
+	ProcessorFallbackURL         string
+	ProcessorAvailabilitySubject string
+	ProcessorPollInterval        time.Duration
+	HealthElectionRetryInterval  time.Duration
+	JetStreamAckWait             time.Duration
+	JetStreamMaxAckPending       int
 }
 
 func FromEnv() (Config, error) {
@@ -57,6 +61,14 @@ func FromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	pollInterval, err := positiveDuration("PROCESSOR_POLL_INTERVAL", 5500*time.Millisecond)
+	if err != nil {
+		return Config{}, err
+	}
+	electionRetryInterval, err := positiveDuration("HEALTH_ELECTION_RETRY_INTERVAL", time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 	consumerAckWait, err := positiveDuration("JETSTREAM_ACK_WAIT", 15*time.Second)
 	if err != nil {
 		return Config{}, err
@@ -79,23 +91,27 @@ func FromEnv() (Config, error) {
 	}
 
 	return Config{
-		HTTPAddr:                 envOr("HTTP_ADDR", ":8080"),
-		DatabaseURL:              envOr("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/rinha?sslmode=disable"),
-		DatabaseMaxConns:         maxConns,
-		NATSURL:                  envOr("NATS_URL", "nats://localhost:4222"),
-		InstanceID:               instanceID,
-		OutboxWorkers:            workers,
-		NATSPublishTimeout:       publishTimeout,
-		OutboxClaimExpiry:        claimExpiry,
-		JetStreamStream:          envOr("JETSTREAM_STREAM", "PAYMENTS"),
-		JetStreamSubject:         envOr("JETSTREAM_SUBJECT", "payments.work"),
-		JetStreamDuplicateWindow: duplicateWindow,
-		ProcessingWorkers:        processingWorkers,
-		PaymentClaimExpiry:       paymentClaimExpiry,
-		ProcessorTimeout:         processorTimeout,
-		ProcessorDefaultURL:      envOr("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
-		JetStreamAckWait:         consumerAckWait,
-		JetStreamMaxAckPending:   consumerMaxAckPending,
+		HTTPAddr:                     envOr("HTTP_ADDR", ":8080"),
+		DatabaseURL:                  envOr("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/rinha?sslmode=disable"),
+		DatabaseMaxConns:             maxConns,
+		NATSURL:                      envOr("NATS_URL", "nats://localhost:4222"),
+		InstanceID:                   instanceID,
+		OutboxWorkers:                workers,
+		NATSPublishTimeout:           publishTimeout,
+		OutboxClaimExpiry:            claimExpiry,
+		JetStreamStream:              envOr("JETSTREAM_STREAM", "PAYMENTS"),
+		JetStreamSubject:             envOr("JETSTREAM_SUBJECT", "payments.work"),
+		JetStreamDuplicateWindow:     duplicateWindow,
+		ProcessingWorkers:            processingWorkers,
+		PaymentClaimExpiry:           paymentClaimExpiry,
+		ProcessorTimeout:             processorTimeout,
+		ProcessorDefaultURL:          envOr("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
+		ProcessorFallbackURL:         envOr("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
+		ProcessorAvailabilitySubject: envOr("PROCESSOR_AVAILABILITY_SUBJECT", "processors.availability"),
+		ProcessorPollInterval:        pollInterval,
+		HealthElectionRetryInterval:  electionRetryInterval,
+		JetStreamAckWait:             consumerAckWait,
+		JetStreamMaxAckPending:       consumerMaxAckPending,
 	}, nil
 }
 

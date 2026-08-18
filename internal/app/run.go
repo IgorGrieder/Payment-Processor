@@ -7,8 +7,10 @@ import (
 	"go.uber.org/zap"
 
 	"payment-processor/internal/acceptance"
+	"payment-processor/internal/availability"
 	"payment-processor/internal/config"
 	"payment-processor/internal/database"
+	"payment-processor/internal/domain"
 	"payment-processor/internal/httpserver"
 	"payment-processor/internal/messaging"
 	"payment-processor/internal/outbox"
@@ -48,20 +50,37 @@ func Run(ctx context.Context, logger *zap.Logger) error {
 	defer cancel()
 
 	store := database.NewStore(pool)
+	availabilityState := availability.New(store, availability.Broadcaster(messaging.NewProcessorAvailabilityPublisher(natsConn, cfg.ProcessorAvailabilitySubject)))
+	unsubscribeAvailability, err := messaging.SubscribeProcessorAvailability(natsConn, cfg.ProcessorAvailabilitySubject, availabilityState.Apply)
+	if err != nil {
+		return fmt.Errorf("subscribe to Processor Availability updates: %w", err)
+	}
+	if err := availabilityState.Hydrate(runCtx); err != nil {
+		unsubscribeAvailability()
+		return fmt.Errorf("hydrate Processor Availability: %w", err)
+	}
+	defer unsubscribeAvailability()
+
+	processors := map[domain.ProcessorService]*processor.Client{
+		domain.DefaultProcessor:  processor.New(domain.DefaultProcessor, cfg.ProcessorDefaultURL, cfg.ProcessorTimeout),
+		domain.FallbackProcessor: processor.New(domain.FallbackProcessor, cfg.ProcessorFallbackURL, cfg.ProcessorTimeout),
+	}
 	acceptor := acceptance.New(store)
 	dispatcher := outbox.NewDispatcher(store, publisher, cfg.OutboxWorkers, cfg.InstanceID, cfg.OutboxClaimExpiry, cfg.NATSPublishTimeout, logger)
 	workers := processing.NewWorkerPool(
 		store,
 		consumer,
-		processor.NewDefault(cfg.ProcessorDefaultURL),
+		availabilityState,
+		processors,
 		cfg.ProcessingWorkers,
 		cfg.InstanceID,
 		cfg.PaymentClaimExpiry,
-		cfg.ProcessorTimeout,
 		logger,
 	)
+	election := availability.NewElection(store, availabilityState, processors, cfg.ProcessorPollInterval, cfg.HealthElectionRetryInterval, logger)
 	dispatcherDone := make(chan struct{})
 	workersDone := make(chan struct{})
+	electionDone := make(chan struct{})
 	go func() {
 		dispatcher.Run(runCtx)
 		close(dispatcherDone)
@@ -70,10 +89,15 @@ func Run(ctx context.Context, logger *zap.Logger) error {
 		workers.Run(runCtx)
 		close(workersDone)
 	}()
+	go func() {
+		election.Run(runCtx)
+		close(electionDone)
+	}()
 	defer func() {
 		cancel()
 		<-dispatcherDone
 		<-workersDone
+		<-electionDone
 	}()
 
 	return httpserver.New(cfg.HTTPAddr, acceptor, logger).Run(runCtx)

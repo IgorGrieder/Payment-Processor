@@ -13,6 +13,7 @@ import (
 	"github.com/nats-io/nuid"
 	"go.uber.org/zap"
 
+	"payment-processor/internal/availability"
 	"payment-processor/internal/database"
 	"payment-processor/internal/domain"
 	"payment-processor/internal/messaging"
@@ -26,26 +27,26 @@ const (
 
 // WorkerPool processes Payment work with a fixed number of workers.
 type WorkerPool struct {
-	store       *database.Store
-	consumer    messaging.WorkConsumer
-	processor   *processor.Default
-	workers     int
-	instanceID  string
-	claimExpiry time.Duration
-	timeout     time.Duration
-	logger      *zap.Logger
+	store        *database.Store
+	consumer     messaging.WorkConsumer
+	availability *availability.Service
+	processors   map[domain.ProcessorService]*processor.Client
+	workers      int
+	instanceID   string
+	claimExpiry  time.Duration
+	logger       *zap.Logger
 }
 
-func NewWorkerPool(store *database.Store, consumer messaging.WorkConsumer, processor *processor.Default, workers int, instanceID string, claimExpiry, timeout time.Duration, logger *zap.Logger) *WorkerPool {
+func NewWorkerPool(store *database.Store, consumer messaging.WorkConsumer, availability *availability.Service, processors map[domain.ProcessorService]*processor.Client, workers int, instanceID string, claimExpiry time.Duration, logger *zap.Logger) *WorkerPool {
 	return &WorkerPool{
-		store:       store,
-		consumer:    consumer,
-		processor:   processor,
-		workers:     workers,
-		instanceID:  instanceID,
-		claimExpiry: claimExpiry,
-		timeout:     timeout,
-		logger:      logger,
+		store:        store,
+		consumer:     consumer,
+		availability: availability,
+		processors:   processors,
+		workers:      workers,
+		instanceID:   instanceID,
+		claimExpiry:  claimExpiry,
+		logger:       logger,
 	}
 }
 
@@ -86,7 +87,12 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 			continue
 		}
 
-		claim, err := p.store.ClaimPayment(ctx, correlationID, claimOwner, p.claimExpiry)
+		selected, selectable := p.availability.Select()
+		var selectedService *domain.ProcessorService
+		if selectable {
+			selectedService = &selected
+		}
+		claim, err := p.store.ClaimPayment(ctx, correlationID, claimOwner, p.claimExpiry, selectedService)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -99,27 +105,41 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 		case domain.PaymentCompleted:
 			p.ack(ctx, delivery, correlationID)
 			continue
+		case domain.PaymentUnassigned:
+			p.logger.Debug("no Processor is selectable for unassigned Payment", zap.String("correlation_id", correlationID.String()))
+			p.nak(ctx, delivery, correlationID)
+			continue
 		case domain.PaymentNotClaimable:
 			p.logger.Debug("Payment is not claimable", zap.String("correlation_id", correlationID.String()))
 			p.nak(ctx, delivery, correlationID)
 			continue
 		}
 
-		p.logger.Debug("claimed Payment", zap.String("correlation_id", correlationID.String()))
-		processorCtx, cancel := context.WithTimeout(ctx, p.timeout)
-		result, err := p.processor.Process(processorCtx, claim.Payment)
-		cancel()
+		client := p.processors[claim.Payment.ProcessorAssignment]
+		if client == nil {
+			p.logger.Error("Payment has no configured assigned Processor", zap.String("correlation_id", correlationID.String()), zap.String("service", string(claim.Payment.ProcessorAssignment)))
+			p.releaseAndNak(ctx, delivery, correlationID, claimOwner)
+			continue
+		}
+
+		p.logger.Debug("claimed Payment", zap.String("correlation_id", correlationID.String()), zap.String("service", string(claim.Payment.ProcessorAssignment)))
+		result, err := client.Process(ctx, claim.Payment)
+		if result == processor.ProcessUnavailable {
+			if availabilityErr := p.availability.RecordPassiveFailure(ctx, claim.Payment.ProcessorAssignment); availabilityErr != nil && ctx.Err() == nil {
+				p.logger.Error("record passive Processor failure", zap.Error(availabilityErr), zap.String("service", string(claim.Payment.ProcessorAssignment)))
+			}
+		}
 		if err != nil || result != processor.ProcessConfirmed {
 			if err != nil {
-				p.logger.Error("process Payment with Default Processor", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+				p.logger.Error("process Payment", zap.Error(err), zap.String("correlation_id", correlationID.String()), zap.String("service", string(claim.Payment.ProcessorAssignment)))
 			} else {
-				p.logger.Error("Default Processor returned an unconfirmed result", zap.String("correlation_id", correlationID.String()))
+				p.logger.Error("Processor returned an unconfirmed result", zap.String("correlation_id", correlationID.String()), zap.String("service", string(claim.Payment.ProcessorAssignment)))
 			}
 			p.releaseAndNak(ctx, delivery, correlationID, claimOwner)
 			continue
 		}
 
-		completed, err := p.store.CompletePayment(ctx, correlationID, claimOwner, p.instanceID)
+		completed, err := p.store.CompletePayment(ctx, correlationID, claimOwner, p.instanceID, claim.Payment.ProcessorAssignment)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -134,7 +154,7 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 			continue
 		}
 
-		p.logger.Debug("completed Payment", zap.String("correlation_id", correlationID.String()))
+		p.logger.Debug("completed Payment", zap.String("correlation_id", correlationID.String()), zap.String("service", string(claim.Payment.ProcessorAssignment)))
 		p.ack(ctx, delivery, correlationID)
 	}
 }

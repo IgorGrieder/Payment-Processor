@@ -27,3 +27,10 @@ CREATE TABLE IF NOT EXISTS payment_outbox (
 CREATE INDEX IF NOT EXISTS payment_outbox_dispatchable
     ON payment_outbox (state, claim_expires_at, correlation_id)
     WHERE state IN ('pending', 'dispatching');
+
+CREATE TABLE IF NOT EXISTS processor_availability (
+    service TEXT PRIMARY KEY CHECK (service IN ('default', 'fallback')),
+    available BOOLEAN NOT NULL,
+    version BIGINT NOT NULL CHECK (version > 0),
+    passive_failure_at TIMESTAMPTZ
+);

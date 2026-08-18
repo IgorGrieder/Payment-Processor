@@ -110,27 +110,35 @@ func (s *Store) ReleaseOutbox(ctx context.Context, correlationID uuid.UUID, clai
 }
 
 // ClaimPayment leases a pending Payment or reclaims an expired processing
-// lease. A prior Processor Assignment is retained so an ambiguous attempt
-// cannot be routed differently on retry. Completed Payments are identified so
-// their JetStream messages can be acknowledged without another Processor call.
-func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claimOwner string, expiry time.Duration) (domain.PaymentClaim, error) {
+// lease. It records selected only for an unassigned Payment. A prior Processor
+// Assignment is retained so an ambiguous attempt cannot be routed differently
+// on retry; without either one, an unassigned Payment remains unclaimed.
+func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claimOwner string, expiry time.Duration, selected *domain.ProcessorService) (domain.PaymentClaim, error) {
+	var selectedService *string
+	if selected != nil {
+		selectedService = new(string)
+		*selectedService = string(*selected)
+	}
+
 	var status string
+	var assignment *string
 	var payment domain.Payment
 	err := s.pool.QueryRow(ctx, `
 		WITH candidate AS (
 			SELECT correlation_id, amount, requested_at, processing_state,
-				processing_claim_expires_at
+				processing_claim_expires_at, processor_assignment
 			FROM payments
 			WHERE correlation_id = $1
 			FOR UPDATE
 		), claimed AS (
 			UPDATE payments AS payment
 			SET processing_state = 'processing',
-				processor_assignment = COALESCE(payment.processor_assignment, 'default'),
+				processor_assignment = COALESCE(payment.processor_assignment, $4),
 				processing_claimed_by = $2,
 				processing_claim_expires_at = now() + ($3 * interval '1 microsecond')
 			FROM candidate
 			WHERE payment.correlation_id = candidate.correlation_id
+				AND (candidate.processor_assignment IS NOT NULL OR $4 IS NOT NULL)
 				AND (
 					candidate.processing_state = 'pending'
 					OR (
@@ -138,18 +146,20 @@ func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claim
 						AND candidate.processing_claim_expires_at <= now()
 					)
 				)
-			RETURNING payment.correlation_id, payment.amount, payment.requested_at
+			RETURNING payment.correlation_id, payment.amount, payment.requested_at,
+				payment.processor_assignment
 		)
-		SELECT 'claimed', correlation_id, amount, requested_at
+		SELECT 'claimed', correlation_id, amount, requested_at, processor_assignment
 		FROM claimed
 		UNION ALL
-		SELECT CASE processing_state
-			WHEN 'completed' THEN 'completed'
+		SELECT CASE
+			WHEN processing_state = 'completed' THEN 'completed'
+			WHEN processor_assignment IS NULL AND $4 IS NULL THEN 'unassigned'
 			ELSE 'not_claimable'
-		END, correlation_id, amount, requested_at
+		END, correlation_id, amount, requested_at, processor_assignment
 		FROM candidate
-		WHERE NOT EXISTS (SELECT 1 FROM claimed)`, correlationID, claimOwner, expiry.Microseconds()).Scan(
-		&status, &payment.CorrelationID, &payment.Amount, &payment.RequestedAt,
+		WHERE NOT EXISTS (SELECT 1 FROM claimed)`, correlationID, claimOwner, expiry.Microseconds(), selectedService).Scan(
+		&status, &payment.CorrelationID, &payment.Amount, &payment.RequestedAt, &assignment,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.PaymentClaim{Status: domain.PaymentNotClaimable}, nil
@@ -157,12 +167,17 @@ func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claim
 	if err != nil {
 		return domain.PaymentClaim{}, fmt.Errorf("claim Payment: %w", err)
 	}
+	if assignment != nil {
+		payment.ProcessorAssignment = domain.ProcessorService(*assignment)
+	}
 
 	switch status {
 	case "claimed":
 		return domain.PaymentClaim{Status: domain.PaymentClaimed, Payment: payment}, nil
 	case "completed":
 		return domain.PaymentClaim{Status: domain.PaymentCompleted}, nil
+	case "unassigned":
+		return domain.PaymentClaim{Status: domain.PaymentUnassigned}, nil
 	default:
 		return domain.PaymentClaim{Status: domain.PaymentNotClaimable}, nil
 	}
@@ -186,20 +201,21 @@ func (s *Store) ReleasePayment(ctx context.Context, correlationID uuid.UUID, cla
 	return result.RowsAffected() == 1, nil
 }
 
-// CompletePayment atomically records Default Processor confirmation only for
-// the active owner of a Payment claim.
-func (s *Store) CompletePayment(ctx context.Context, correlationID uuid.UUID, claimOwner, completedByInstance string) (bool, error) {
+// CompletePayment atomically records confirmation by the assigned Processor
+// only for the active owner of a Payment claim.
+func (s *Store) CompletePayment(ctx context.Context, correlationID uuid.UUID, claimOwner, completedByInstance string, service domain.ProcessorService) (bool, error) {
 	result, err := s.pool.Exec(ctx, `
 		UPDATE payments
 		SET processing_state = 'completed',
-			processed_by_service = 'default',
+			processed_by_service = $4,
 			completed_by_instance = $3,
 			completed_at = now(),
 			processing_claimed_by = NULL,
 			processing_claim_expires_at = NULL
 		WHERE correlation_id = $1
 			AND processing_state = 'processing'
-			AND processing_claimed_by = $2`, correlationID, claimOwner, completedByInstance)
+			AND processing_claimed_by = $2
+			AND processor_assignment = $4`, correlationID, claimOwner, completedByInstance, string(service))
 	if err != nil {
 		return false, fmt.Errorf("complete Payment: %w", err)
 	}
@@ -220,4 +236,147 @@ func (s *Store) MarkOutboxDispatched(ctx context.Context, correlationID uuid.UUI
 		return false, fmt.Errorf("mark outbox row dispatched: %w", err)
 	}
 	return result.RowsAffected() == 1, nil
+}
+
+// ReadProcessorAvailability returns the authoritative startup state for every
+// Processor that has a persisted observation.
+func (s *Store) ReadProcessorAvailability(ctx context.Context) ([]domain.ProcessorAvailability, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT service, available, version, passive_failure_at
+		FROM processor_availability`)
+	if err != nil {
+		return nil, fmt.Errorf("read Processor Availability: %w", err)
+	}
+	defer rows.Close()
+
+	var availability []domain.ProcessorAvailability
+	for rows.Next() {
+		var state domain.ProcessorAvailability
+		var service string
+		if err := rows.Scan(&service, &state.Available, &state.Version, &state.PassiveFailureAt); err != nil {
+			return nil, fmt.Errorf("scan Processor Availability: %w", err)
+		}
+		state.Service = domain.ProcessorService(service)
+		if !state.Service.Valid() {
+			return nil, fmt.Errorf("read invalid Processor service %q", service)
+		}
+		availability = append(availability, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Processor Availability: %w", err)
+	}
+	return availability, nil
+}
+
+// AvailabilityPollStartedAt obtains the database time immediately before a
+// Processor Availability HTTP request begins. It orders recovery against a
+// concurrent passive failure without trusting instance clocks.
+func (s *Store) AvailabilityPollStartedAt(ctx context.Context) (time.Time, error) {
+	var startedAt time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&startedAt); err != nil {
+		return time.Time{}, fmt.Errorf("record Processor Availability poll start: %w", err)
+	}
+	return startedAt, nil
+}
+
+// RecordPassiveFailure atomically marks a Processor unavailable and records
+// the database timestamp that later healthy polls must follow.
+func (s *Store) RecordPassiveFailure(ctx context.Context, service domain.ProcessorService) (domain.ProcessorAvailability, error) {
+	return s.upsertProcessorAvailability(ctx, `
+		INSERT INTO processor_availability (service, available, version, passive_failure_at)
+		VALUES ($1, FALSE, 1, now())
+		ON CONFLICT (service) DO UPDATE
+		SET available = FALSE,
+			version = processor_availability.version + 1,
+			passive_failure_at = now()
+		RETURNING service, available, version, passive_failure_at`, service)
+}
+
+// RecordPollObservation records a successful health response. A healthy
+// observation that began no later than the latest passive failure is rejected,
+// so an older in-flight poll cannot restore new work routing.
+func (s *Store) RecordPollObservation(ctx context.Context, service domain.ProcessorService, available bool, startedAt time.Time) (domain.ProcessorAvailability, bool, error) {
+	state, err := s.upsertProcessorAvailability(ctx, `
+		INSERT INTO processor_availability (service, available, version)
+		VALUES ($1, $2, 1)
+		ON CONFLICT (service) DO UPDATE
+		SET available = EXCLUDED.available,
+			version = processor_availability.version + 1
+		WHERE NOT EXCLUDED.available
+			OR processor_availability.passive_failure_at IS NULL
+			OR processor_availability.passive_failure_at < $3
+		RETURNING service, available, version, passive_failure_at`, service, available, startedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ProcessorAvailability{}, false, nil
+	}
+	if err != nil {
+		return domain.ProcessorAvailability{}, false, fmt.Errorf("record Processor Availability poll observation: %w", err)
+	}
+	return state, true, nil
+}
+
+func (s *Store) upsertProcessorAvailability(ctx context.Context, query string, arguments ...any) (domain.ProcessorAvailability, error) {
+	var state domain.ProcessorAvailability
+	var service string
+	if err := s.pool.QueryRow(ctx, query, arguments...).Scan(&service, &state.Available, &state.Version, &state.PassiveFailureAt); err != nil {
+		return domain.ProcessorAvailability{}, err
+	}
+	state.Service = domain.ProcessorService(service)
+	if !state.Service.Valid() {
+		return domain.ProcessorAvailability{}, fmt.Errorf("read invalid Processor service %q", service)
+	}
+	return state, nil
+}
+
+const healthAdvisoryLockKey int64 = 202504
+
+// HealthLeadership holds the dedicated PostgreSQL session containing this
+// instance's lifetime advisory lock. It must be closed rather than returned to
+// the pool while still locked, because advisory locks are session-scoped.
+type HealthLeadership struct {
+	conn *pgxpool.Conn
+}
+
+// TryHealthLeadership tries to acquire the shared health-poller lock on a
+// dedicated pool connection. The returned connection is not used for state
+// reads or writes, which remain short-lived pool operations.
+func (s *Store) TryHealthLeadership(ctx context.Context) (*HealthLeadership, bool, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquire health leadership connection: %w", err)
+	}
+
+	var acquired bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, healthAdvisoryLockKey).Scan(&acquired); err != nil {
+		conn.Release()
+		return nil, false, fmt.Errorf("try health advisory lock: %w", err)
+	}
+	if !acquired {
+		conn.Release()
+		return nil, false, nil
+	}
+	return &HealthLeadership{conn: conn}, true, nil
+}
+
+// Alive verifies the lock session remains connected before a scheduled poll.
+func (l *HealthLeadership) Alive(ctx context.Context) error {
+	if err := l.conn.QueryRow(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+		return fmt.Errorf("check health leadership connection: %w", err)
+	}
+	return nil
+}
+
+// Close relinquishes leadership. If unlock cannot be confirmed, closing the
+// physical session guarantees PostgreSQL releases its advisory lock.
+func (l *HealthLeadership) Close(ctx context.Context) {
+	if l == nil || l.conn == nil {
+		return
+	}
+	var unlocked bool
+	err := l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, healthAdvisoryLockKey).Scan(&unlocked)
+	if err != nil || !unlocked {
+		_ = l.conn.Conn().Close(ctx)
+	}
+	l.conn.Release()
+	l.conn = nil
 }
