@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"payment-processor/internal/domain"
 )
 
 // Store owns PostgreSQL persistence for accepted Payments and outbox control.
@@ -105,6 +107,77 @@ func (s *Store) ReleaseOutbox(ctx context.Context, correlationID uuid.UUID, clai
 		return fmt.Errorf("release outbox row: %w", err)
 	}
 	return nil
+}
+
+// ClaimPayment atomically assigns Default Processor work and leases a pending
+// Payment to claimOwner. It also identifies already completed Payments so their
+// JetStream messages can be acknowledged without another Processor call.
+func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claimOwner string, expiry time.Duration) (domain.PaymentClaim, error) {
+	var status string
+	var payment domain.Payment
+	err := s.pool.QueryRow(ctx, `
+		WITH candidate AS (
+			SELECT correlation_id, amount, requested_at, processing_state
+			FROM payments
+			WHERE correlation_id = $1
+			FOR UPDATE
+		), claimed AS (
+			UPDATE payments AS payment
+			SET processing_state = 'processing',
+				processor_assignment = 'default',
+				processing_claimed_by = $2,
+				processing_claim_expires_at = now() + ($3 * interval '1 microsecond')
+			FROM candidate
+			WHERE payment.correlation_id = candidate.correlation_id
+				AND candidate.processing_state = 'pending'
+			RETURNING payment.correlation_id, payment.amount, payment.requested_at
+		)
+		SELECT 'claimed', correlation_id, amount, requested_at
+		FROM claimed
+		UNION ALL
+		SELECT CASE processing_state
+			WHEN 'completed' THEN 'completed'
+			ELSE 'not_claimable'
+		END, correlation_id, amount, requested_at
+		FROM candidate
+		WHERE NOT EXISTS (SELECT 1 FROM claimed)`, correlationID, claimOwner, expiry.Microseconds()).Scan(
+		&status, &payment.CorrelationID, &payment.Amount, &payment.RequestedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.PaymentClaim{Status: domain.PaymentNotClaimable}, nil
+	}
+	if err != nil {
+		return domain.PaymentClaim{}, fmt.Errorf("claim Payment: %w", err)
+	}
+
+	switch status {
+	case "claimed":
+		return domain.PaymentClaim{Status: domain.PaymentClaimed, Payment: payment}, nil
+	case "completed":
+		return domain.PaymentClaim{Status: domain.PaymentCompleted}, nil
+	default:
+		return domain.PaymentClaim{Status: domain.PaymentNotClaimable}, nil
+	}
+}
+
+// CompletePayment atomically records Default Processor confirmation only for
+// the active owner of a Payment claim.
+func (s *Store) CompletePayment(ctx context.Context, correlationID uuid.UUID, claimOwner, completedByInstance string) (bool, error) {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE payments
+		SET processing_state = 'completed',
+			processed_by_service = 'default',
+			completed_by_instance = $3,
+			completed_at = now(),
+			processing_claimed_by = NULL,
+			processing_claim_expires_at = NULL
+		WHERE correlation_id = $1
+			AND processing_state = 'processing'
+			AND processing_claimed_by = $2`, correlationID, claimOwner, completedByInstance)
+	if err != nil {
+		return false, fmt.Errorf("complete Payment: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
 }
 
 // MarkOutboxDispatched records a confirmed JetStream publication. The claim

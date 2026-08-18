@@ -20,6 +20,12 @@ type Config struct {
 	JetStreamStream          string
 	JetStreamSubject         string
 	JetStreamDuplicateWindow time.Duration
+	ProcessingWorkers        int
+	PaymentClaimExpiry       time.Duration
+	ProcessorTimeout         time.Duration
+	ProcessorDefaultURL      string
+	JetStreamAckWait         time.Duration
+	JetStreamMaxAckPending   int
 }
 
 func FromEnv() (Config, error) {
@@ -31,11 +37,31 @@ func FromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	processingWorkers, err := positiveInt("PROCESSING_WORKERS", 6)
+	if err != nil {
+		return Config{}, err
+	}
 	publishTimeout, err := positiveDuration("NATS_PUBLISH_TIMEOUT", 2*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
 	claimExpiry, err := positiveDuration("OUTBOX_CLAIM_EXPIRY", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	paymentClaimExpiry, err := positiveDuration("PAYMENT_CLAIM_EXPIRY", 20*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	processorTimeout, err := positiveDuration("PROCESSOR_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	consumerAckWait, err := positiveDuration("JETSTREAM_ACK_WAIT", 15*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	consumerMaxAckPending, err := positiveInt("JETSTREAM_MAX_ACK_PENDING", 12)
 	if err != nil {
 		return Config{}, err
 	}
@@ -64,6 +90,12 @@ func FromEnv() (Config, error) {
 		JetStreamStream:          envOr("JETSTREAM_STREAM", "PAYMENTS"),
 		JetStreamSubject:         envOr("JETSTREAM_SUBJECT", "payments.work"),
 		JetStreamDuplicateWindow: duplicateWindow,
+		ProcessingWorkers:        processingWorkers,
+		PaymentClaimExpiry:       paymentClaimExpiry,
+		ProcessorTimeout:         processorTimeout,
+		ProcessorDefaultURL:      envOr("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
+		JetStreamAckWait:         consumerAckWait,
+		JetStreamMaxAckPending:   consumerMaxAckPending,
 	}, nil
 }
 

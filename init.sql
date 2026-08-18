@@ -1,7 +1,17 @@
 CREATE TABLE IF NOT EXISTS payments (
     correlation_id UUID PRIMARY KEY,
     amount BIGINT NOT NULL CHECK (amount > 0),
-    requested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processing_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (processing_state IN ('pending', 'processing', 'completed')),
+    processor_assignment TEXT
+        CHECK (processor_assignment IN ('default', 'fallback')),
+    processing_claimed_by TEXT,
+    processing_claim_expires_at TIMESTAMPTZ,
+    processed_by_service TEXT
+        CHECK (processed_by_service IN ('default', 'fallback')),
+    completed_by_instance TEXT,
+    completed_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS payments_requested_at ON payments (requested_at);

@@ -12,6 +12,8 @@ import (
 	"payment-processor/internal/httpserver"
 	"payment-processor/internal/messaging"
 	"payment-processor/internal/outbox"
+	"payment-processor/internal/processing"
+	"payment-processor/internal/processor"
 )
 
 // Run composes the process dependencies and runs its HTTP server.
@@ -37,6 +39,10 @@ func Run(ctx context.Context, logger *zap.Logger) error {
 	if err != nil {
 		return fmt.Errorf("provision JetStream work stream: %w", err)
 	}
+	consumer, err := messaging.ProvisionWorkConsumer(natsConn, cfg.JetStreamStream, cfg.JetStreamSubject, cfg.JetStreamAckWait, cfg.JetStreamMaxAckPending)
+	if err != nil {
+		return fmt.Errorf("provision JetStream work consumer: %w", err)
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -44,14 +50,30 @@ func Run(ctx context.Context, logger *zap.Logger) error {
 	store := database.NewStore(pool)
 	acceptor := acceptance.New(store)
 	dispatcher := outbox.NewDispatcher(store, publisher, cfg.OutboxWorkers, cfg.InstanceID, cfg.OutboxClaimExpiry, cfg.NATSPublishTimeout, logger)
+	workers := processing.NewWorkerPool(
+		store,
+		consumer,
+		processor.NewDefault(cfg.ProcessorDefaultURL),
+		cfg.ProcessingWorkers,
+		cfg.InstanceID,
+		cfg.PaymentClaimExpiry,
+		cfg.ProcessorTimeout,
+		logger,
+	)
 	dispatcherDone := make(chan struct{})
+	workersDone := make(chan struct{})
 	go func() {
 		dispatcher.Run(runCtx)
 		close(dispatcherDone)
 	}()
+	go func() {
+		workers.Run(runCtx)
+		close(workersDone)
+	}()
 	defer func() {
 		cancel()
 		<-dispatcherDone
+		<-workersDone
 	}()
 
 	return httpserver.New(cfg.HTTPAddr, acceptor, logger).Run(runCtx)
