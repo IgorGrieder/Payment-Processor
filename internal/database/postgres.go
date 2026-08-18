@@ -109,27 +109,35 @@ func (s *Store) ReleaseOutbox(ctx context.Context, correlationID uuid.UUID, clai
 	return nil
 }
 
-// ClaimPayment atomically assigns Default Processor work and leases a pending
-// Payment to claimOwner. It also identifies already completed Payments so their
-// JetStream messages can be acknowledged without another Processor call.
+// ClaimPayment leases a pending Payment or reclaims an expired processing
+// lease. A prior Processor Assignment is retained so an ambiguous attempt
+// cannot be routed differently on retry. Completed Payments are identified so
+// their JetStream messages can be acknowledged without another Processor call.
 func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claimOwner string, expiry time.Duration) (domain.PaymentClaim, error) {
 	var status string
 	var payment domain.Payment
 	err := s.pool.QueryRow(ctx, `
 		WITH candidate AS (
-			SELECT correlation_id, amount, requested_at, processing_state
+			SELECT correlation_id, amount, requested_at, processing_state,
+				processing_claim_expires_at
 			FROM payments
 			WHERE correlation_id = $1
 			FOR UPDATE
 		), claimed AS (
 			UPDATE payments AS payment
 			SET processing_state = 'processing',
-				processor_assignment = 'default',
+				processor_assignment = COALESCE(payment.processor_assignment, 'default'),
 				processing_claimed_by = $2,
 				processing_claim_expires_at = now() + ($3 * interval '1 microsecond')
 			FROM candidate
 			WHERE payment.correlation_id = candidate.correlation_id
-				AND candidate.processing_state = 'pending'
+				AND (
+					candidate.processing_state = 'pending'
+					OR (
+						candidate.processing_state = 'processing'
+						AND candidate.processing_claim_expires_at <= now()
+					)
+				)
 			RETURNING payment.correlation_id, payment.amount, payment.requested_at
 		)
 		SELECT 'claimed', correlation_id, amount, requested_at
@@ -158,6 +166,24 @@ func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claim
 	default:
 		return domain.PaymentClaim{Status: domain.PaymentNotClaimable}, nil
 	}
+}
+
+// ReleasePayment returns a current worker's retryable claim to pending while
+// retaining its Processor Assignment. A changed claim owner prevents an
+// expired worker from releasing a newer lease.
+func (s *Store) ReleasePayment(ctx context.Context, correlationID uuid.UUID, claimOwner string) (bool, error) {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE payments
+		SET processing_state = 'pending',
+			processing_claimed_by = NULL,
+			processing_claim_expires_at = NULL
+		WHERE correlation_id = $1
+			AND processing_state = 'processing'
+			AND processing_claimed_by = $2`, correlationID, claimOwner)
+	if err != nil {
+		return false, fmt.Errorf("release Payment: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
 }
 
 // CompletePayment atomically records Default Processor confirmation only for

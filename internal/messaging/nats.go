@@ -36,6 +36,7 @@ type WorkConsumer interface {
 type WorkDelivery interface {
 	CorrelationID() (uuid.UUID, error)
 	Ack(ctx context.Context) error
+	Nak(delay time.Duration) error
 }
 
 type jetStreamWorkConsumer struct {
@@ -146,6 +147,14 @@ func (d jetStreamWorkDelivery) CorrelationID() (uuid.UUID, error) {
 func (d jetStreamWorkDelivery) Ack(ctx context.Context) error {
 	if err := d.message.AckSync(nats.Context(ctx)); err != nil {
 		return fmt.Errorf("acknowledge Payment work reference: %w", err)
+	}
+	return nil
+}
+
+// Nak schedules a redelivery without waiting for the consumer AckWait.
+func (d jetStreamWorkDelivery) Nak(delay time.Duration) error {
+	if err := d.message.NakWithDelay(delay); err != nil {
+		return fmt.Errorf("delay Payment work redelivery: %w", err)
 	}
 	return nil
 }

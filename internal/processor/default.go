@@ -28,34 +28,45 @@ func NewDefault(url string) *Default {
 	}
 }
 
-// Process sends the stored Payment representation. Only a confirmed 200 OK is
-// success in this slice.
-func (p *Default) Process(ctx context.Context, payment domain.Payment) error {
+// ProcessResult reports whether a Processor response confirmed Payment
+// processing. All non-confirming HTTP responses and transport failures are
+// retryable.
+type ProcessResult uint8
+
+const (
+	ProcessRetryable ProcessResult = iota
+	ProcessConfirmed
+)
+
+// Process sends the stored Payment representation. Both 200 OK and 422
+// Unprocessable Entity confirm processing: the latter means the Processor
+// already recorded this correlation ID during an ambiguous prior attempt.
+func (p *Default) Process(ctx context.Context, payment domain.Payment) (ProcessResult, error) {
 	body, err := json.Marshal(processRequest{
 		CorrelationID: payment.CorrelationID.String(),
 		Amount:        cents(payment.Amount),
 		RequestedAt:   payment.RequestedAt.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
-		return fmt.Errorf("encode Default Processor Payment: %w", err)
+		return ProcessRetryable, fmt.Errorf("encode Default Processor Payment: %w", err)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/payments", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build Default Processor request: %w", err)
+		return ProcessRetryable, fmt.Errorf("build Default Processor request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := p.client.Do(request)
 	if err != nil {
-		return fmt.Errorf("call Default Processor: %w", err)
+		return ProcessRetryable, fmt.Errorf("call Default Processor: %w", err)
 	}
 	defer response.Body.Close()
 	discardResponseBody(response.Body)
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("Default Processor returned %s", response.Status)
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusUnprocessableEntity {
+		return ProcessRetryable, fmt.Errorf("Default Processor returned %s", response.Status)
 	}
-	return nil
+	return ProcessConfirmed, nil
 }
 
 func discardResponseBody(body io.Reader) {

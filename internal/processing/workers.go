@@ -19,7 +19,10 @@ import (
 	"payment-processor/internal/processor"
 )
 
-const failureRetryInterval = time.Second
+const (
+	failureRetryInterval = time.Second
+	processingRetryDelay = 6 * time.Second
+)
 
 // WorkerPool processes Payment work with a fixed number of workers.
 type WorkerPool struct {
@@ -79,6 +82,7 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 		correlationID, err := delivery.CorrelationID()
 		if err != nil {
 			p.logger.Error("read Payment work reference", zap.Error(err))
+			p.nak(ctx, delivery, uuid.Nil)
 			continue
 		}
 
@@ -88,6 +92,7 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 				return
 			}
 			p.logger.Error("claim Payment", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+			p.nak(ctx, delivery, correlationID)
 			continue
 		}
 		switch claim.Status {
@@ -95,17 +100,22 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 			p.ack(ctx, delivery, correlationID)
 			continue
 		case domain.PaymentNotClaimable:
-			// Lease-expiry recovery is intentionally deferred to Slice 3.
 			p.logger.Debug("Payment is not claimable", zap.String("correlation_id", correlationID.String()))
+			p.nak(ctx, delivery, correlationID)
 			continue
 		}
 
 		p.logger.Debug("claimed Payment", zap.String("correlation_id", correlationID.String()))
 		processorCtx, cancel := context.WithTimeout(ctx, p.timeout)
-		err = p.processor.Process(processorCtx, claim.Payment)
+		result, err := p.processor.Process(processorCtx, claim.Payment)
 		cancel()
-		if err != nil {
-			p.logger.Error("process Payment with Default Processor", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+		if err != nil || result != processor.ProcessConfirmed {
+			if err != nil {
+				p.logger.Error("process Payment with Default Processor", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+			} else {
+				p.logger.Error("Default Processor returned an unconfirmed result", zap.String("correlation_id", correlationID.String()))
+			}
+			p.releaseAndNak(ctx, delivery, correlationID, claimOwner)
 			continue
 		}
 
@@ -115,10 +125,12 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 				return
 			}
 			p.logger.Error("record completed Payment", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+			p.nak(ctx, delivery, correlationID)
 			continue
 		}
 		if !completed {
 			p.logger.Warn("Payment claim was lost before completion", zap.String("correlation_id", correlationID.String()))
+			p.nak(ctx, delivery, correlationID)
 			continue
 		}
 
@@ -127,9 +139,31 @@ func (p *WorkerPool) runWorker(ctx context.Context, claimOwner string) {
 	}
 }
 
+func (p *WorkerPool) releaseAndNak(ctx context.Context, delivery messaging.WorkDelivery, correlationID uuid.UUID, claimOwner string) {
+	released, err := p.store.ReleasePayment(ctx, correlationID, claimOwner)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		p.logger.Error("release retryable Payment claim", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+	} else if !released {
+		p.logger.Warn("Payment claim was lost before release", zap.String("correlation_id", correlationID.String()))
+	}
+	p.nak(ctx, delivery, correlationID)
+}
+
 func (p *WorkerPool) ack(ctx context.Context, delivery messaging.WorkDelivery, correlationID uuid.UUID) {
 	if err := delivery.Ack(ctx); err != nil && ctx.Err() == nil {
 		p.logger.Error("acknowledge completed Payment work", zap.Error(err), zap.String("correlation_id", correlationID.String()))
+	}
+}
+
+func (p *WorkerPool) nak(ctx context.Context, delivery messaging.WorkDelivery, correlationID uuid.UUID) {
+	if ctx.Err() != nil {
+		return
+	}
+	if err := delivery.Nak(processingRetryDelay); err != nil && ctx.Err() == nil {
+		p.logger.Error("delay Payment work retry", zap.Error(err), zap.String("correlation_id", correlationID.String()))
 	}
 }
 
