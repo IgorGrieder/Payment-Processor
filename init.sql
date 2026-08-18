@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS payments (
 
 CREATE INDEX IF NOT EXISTS payments_requested_at ON payments (requested_at);
 
+CREATE INDEX IF NOT EXISTS payments_completed_summary
+    ON payments (requested_at) INCLUDE (processed_by_service, amount)
+    WHERE processing_state = 'completed';
+
 CREATE TABLE IF NOT EXISTS payment_outbox (
     correlation_id UUID PRIMARY KEY REFERENCES payments (correlation_id),
     state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'dispatched')),

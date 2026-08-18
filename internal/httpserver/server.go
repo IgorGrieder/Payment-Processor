@@ -9,7 +9,9 @@ import (
 
 	"go.uber.org/zap"
 
+	"payment-processor/internal/database"
 	"payment-processor/internal/intake"
+	"payment-processor/internal/summary"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -20,9 +22,10 @@ type Server struct {
 	logger *zap.Logger
 }
 
-func New(addr string, acceptor intake.PaymentAccepter, logger *zap.Logger) *Server {
+func New(addr string, acceptor intake.PaymentAccepter, store *database.Store, logger *zap.Logger) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("POST /payments", intake.NewHandler(acceptor, logger))
+	mux.Handle("GET /payments-summary", summary.NewHandler(store, logger))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

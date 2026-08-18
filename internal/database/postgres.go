@@ -238,6 +238,52 @@ func (s *Store) MarkOutboxDispatched(ctx context.Context, correlationID uuid.UUI
 	return result.RowsAffected() == 1, nil
 }
 
+// PaymentSummary reads completed Payments by their acceptance timestamps. The
+// Processor contract treats a missing bound as an unfiltered request, so a
+// timestamp predicate is used only when both bounds are present.
+func (s *Store) PaymentSummary(ctx context.Context, from, to *time.Time) (domain.PaymentSummary, error) {
+	query := `
+		SELECT processed_by_service, COUNT(*), COALESCE(SUM(amount), 0)
+		FROM payments
+		WHERE processing_state = 'completed'`
+	var arguments []any
+	if from != nil && to != nil {
+		query += `
+			AND requested_at >= $1 AND requested_at <= $2`
+		arguments = []any{*from, *to}
+	}
+	query += `
+		GROUP BY processed_by_service`
+
+	rows, err := s.pool.Query(ctx, query, arguments...)
+	if err != nil {
+		return domain.PaymentSummary{}, fmt.Errorf("query Payment Summary: %w", err)
+	}
+	defer rows.Close()
+
+	var summary domain.PaymentSummary
+	for rows.Next() {
+		var service string
+		var total domain.ProcessorTotal
+		if err := rows.Scan(&service, &total.TotalRequests, &total.TotalAmountCents); err != nil {
+			return domain.PaymentSummary{}, fmt.Errorf("scan Payment Summary: %w", err)
+		}
+
+		switch domain.ProcessorService(service) {
+		case domain.DefaultProcessor:
+			summary.Default = total
+		case domain.FallbackProcessor:
+			summary.Fallback = total
+		default:
+			return domain.PaymentSummary{}, fmt.Errorf("read invalid Processor service %q", service)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return domain.PaymentSummary{}, fmt.Errorf("iterate Payment Summary: %w", err)
+	}
+	return summary, nil
+}
+
 // ReadProcessorAvailability returns the authoritative startup state for every
 // Processor that has a persisted observation.
 func (s *Store) ReadProcessorAvailability(ctx context.Context) ([]domain.ProcessorAvailability, error) {

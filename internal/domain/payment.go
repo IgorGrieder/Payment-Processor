@@ -49,3 +49,15 @@ type PaymentClaim struct {
 	Status  PaymentClaimStatus
 	Payment Payment
 }
+
+// PaymentSummary is the completed-Payment audit total for both Processor services.
+type PaymentSummary struct {
+	Default  ProcessorTotal
+	Fallback ProcessorTotal
+}
+
+// ProcessorTotal preserves money in cents until the HTTP JSON boundary.
+type ProcessorTotal struct {
+	TotalRequests    int64
+	TotalAmountCents int64
+}

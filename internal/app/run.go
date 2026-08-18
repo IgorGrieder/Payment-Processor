@@ -100,5 +100,5 @@ func Run(ctx context.Context, logger *zap.Logger) error {
 		<-electionDone
 	}()
 
-	return httpserver.New(cfg.HTTPAddr, acceptor, logger).Run(runCtx)
+	return httpserver.New(cfg.HTTPAddr, acceptor, store, logger).Run(runCtx)
 }
