@@ -16,6 +16,7 @@ This repository is being built collaboratively for the Rinha de Backend 2025 pay
 - Prefer the fewest abstractions that clearly serve the current slice. Avoid speculative abstractions and overengineering.
 - Define an interface only at a real seam where behavior varies; keep every interface minimal, focused, and caller-oriented.
 - Prefer functional composition: explicit dependencies, data, and functions over object-oriented hierarchies or stateful objects.
+- Comments must explain a non-obvious constraint, ordering rule, or reason. Do not add package-level or module-ownership comments that merely restate what a package is responsible for; explain system-wide behavior with diagrams or prose when requested.
 
 ## Agreed architecture
 
@@ -51,9 +52,9 @@ Do not change these decisions without an explicit user instruction.
 - A worker atomically claims a pending payment before an external call. Claims expire after 20 seconds so crashes can be recovered.
 - A completed payment is ACKed without another processor call. On confirmed 200 or the processor's duplicate `422`, atomically mark it completed in PostgreSQL before ACKing JetStream.
 - Processor calls use configurable `PROCESSOR_TIMEOUT=10s`. JetStream `AckWait` is 15 seconds. If both processors are unavailable, explicitly NAK with an initial 6-second delay; do not sleep while holding a worker.
-- The default processor is always selected while healthy; ignore `minResponseTime` initially because fee minimization takes precedence over latency.
-- If default is known failing and fallback is healthy, assign new work to fallback. If both are failing, retry later through JetStream.
-- Persist the assigned processor before the first call. After an ambiguous failure (timeout/connection failure), retry that same processor rather than immediately crossing to fallback, preventing a payment from being processed by both services.
+- A new unassigned Payment uses Default only when Default is known healthy; ignore `minResponseTime` initially because fee minimization takes precedence over latency.
+- If Default is unknown or unavailable, use Fallback only when Fallback is known healthy; otherwise retry later through JetStream. This avoids sending new work to a Processor whose availability is unknown.
+- Persist the assigned processor before the first call. After any unconfirmed processing attempt, including a timeout, connection failure, or 5xx, retry that same processor rather than immediately crossing to fallback, preventing a payment from being processed by both services.
 - A real timeout or 5xx immediately marks that processor unavailable in shared health state. It remains unavailable for new assignments until the next scheduled health poll reports it healthy.
 
 ### Shared health state and deployment
