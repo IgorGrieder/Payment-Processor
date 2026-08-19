@@ -133,12 +133,12 @@ func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claim
 		), claimed AS (
 			UPDATE payments AS payment
 			SET processing_state = 'processing',
-				processor_assignment = COALESCE(payment.processor_assignment, $4),
+				processor_assignment = COALESCE(payment.processor_assignment, $4::text),
 				processing_claimed_by = $2,
 				processing_claim_expires_at = now() + ($3 * interval '1 microsecond')
 			FROM candidate
 			WHERE payment.correlation_id = candidate.correlation_id
-				AND (candidate.processor_assignment IS NOT NULL OR $4 IS NOT NULL)
+				AND (candidate.processor_assignment IS NOT NULL OR $4::text IS NOT NULL)
 				AND (
 					candidate.processing_state = 'pending'
 					OR (
@@ -154,7 +154,7 @@ func (s *Store) ClaimPayment(ctx context.Context, correlationID uuid.UUID, claim
 		UNION ALL
 		SELECT CASE
 			WHEN processing_state = 'completed' THEN 'completed'
-			WHEN processor_assignment IS NULL AND $4 IS NULL THEN 'unassigned'
+			WHEN processor_assignment IS NULL AND $4::text IS NULL THEN 'unassigned'
 			ELSE 'not_claimable'
 		END, correlation_id, amount, requested_at, processor_assignment
 		FROM candidate

@@ -17,7 +17,7 @@ services:
       resources:
         limits:
           cpus: "0.05"
-          memory: 16M
+          memory: 16MB
 
   api-1:
     build:
@@ -53,7 +53,7 @@ services:
       resources:
         limits:
           cpus: "0.30"
-          memory: 64M
+          memory: 64MB
 
   api-2:
     build:
@@ -89,7 +89,7 @@ services:
       resources:
         limits:
           cpus: "0.30"
-          memory: 64M
+          memory: 64MB
 
   postgres:
     image: postgres:17-alpine
@@ -99,7 +99,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d rinha"]
+      test: ["CMD-SHELL", "psql -U postgres -d rinha -tAc \"SELECT to_regclass('public.payments') = 'payments'::regclass\" | grep -qx t"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -112,7 +112,7 @@ services:
       resources:
         limits:
           cpus: "0.70"
-          memory: 158M
+          memory: 158MB
 
   nats:
     image: nats:2-alpine
@@ -126,7 +126,7 @@ services:
       resources:
         limits:
           cpus: "0.15"
-          memory: 48M
+          memory: 48MB
 
 networks:
   backend:
