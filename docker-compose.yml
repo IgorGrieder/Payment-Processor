@@ -1,21 +1,99 @@
 services:
-  api:
+  nginx:
+    image: nginx:1.27-alpine
+    platform: linux/amd64
+    depends_on:
+      api-1:
+        condition: service_started
+      api-2:
+        condition: service_started
+    ports:
+      - "9999:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: 16M
+
+  api-1:
     build:
       context: .
+    platform: linux/amd64
     environment:
       HTTP_ADDR: :8080
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/rinha?sslmode=disable
+      DATABASE_MAX_CONNS: "12"
       NATS_URL: nats://nats:4222
+      INSTANCE_ID: api-1
+      OUTBOX_WORKERS: "1"
+      NATS_PUBLISH_TIMEOUT: 2s
+      OUTBOX_CLAIM_EXPIRY: 5s
+      PROCESSING_WORKERS: "6"
+      PAYMENT_CLAIM_EXPIRY: 20s
+      PROCESSOR_TIMEOUT: 10s
+      PROCESSOR_DEFAULT_URL: http://payment-processor-default:8080
+      PROCESSOR_FALLBACK_URL: http://payment-processor-fallback:8080
+      PROCESSOR_POLL_INTERVAL: 5.5s
+      HEALTH_ELECTION_RETRY_INTERVAL: 1s
+      JETSTREAM_ACK_WAIT: 15s
+      JETSTREAM_MAX_ACK_PENDING: "12"
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_started
-    ports:
-      - "9999:8080"
+    networks:
+      - backend
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 64M
+
+  api-2:
+    build:
+      context: .
+    platform: linux/amd64
+    environment:
+      HTTP_ADDR: :8080
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/rinha?sslmode=disable
+      DATABASE_MAX_CONNS: "12"
+      NATS_URL: nats://nats:4222
+      INSTANCE_ID: api-2
+      OUTBOX_WORKERS: "1"
+      NATS_PUBLISH_TIMEOUT: 2s
+      OUTBOX_CLAIM_EXPIRY: 5s
+      PROCESSING_WORKERS: "6"
+      PAYMENT_CLAIM_EXPIRY: 20s
+      PROCESSOR_TIMEOUT: 10s
+      PROCESSOR_DEFAULT_URL: http://payment-processor-default:8080
+      PROCESSOR_FALLBACK_URL: http://payment-processor-fallback:8080
+      PROCESSOR_POLL_INTERVAL: 5.5s
+      HEALTH_ELECTION_RETRY_INTERVAL: 1s
+      JETSTREAM_ACK_WAIT: 15s
+      JETSTREAM_MAX_ACK_PENDING: "12"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    networks:
+      - backend
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 64M
 
   postgres:
     image: postgres:17-alpine
+    platform: linux/amd64
     environment:
       POSTGRES_DB: rinha
       POSTGRES_USER: postgres
@@ -25,19 +103,37 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
-    ports:
-      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.70"
+          memory: 158M
 
   nats:
     image: nats:2-alpine
+    platform: linux/amd64
     command: ["-js", "-sd", "/data"]
-    ports:
-      - "4222:4222"
     volumes:
       - nats-data:/data
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: 48M
+
+networks:
+  backend:
+    driver: bridge
+  payment-processor:
+    external: true
+    name: payment-processor
 
 volumes:
   postgres-data:
